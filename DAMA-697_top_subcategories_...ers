@@ -1,0 +1,88 @@
+WITH promo_contains AS (
+SELECT 
+  partner,
+   '' AS type,
+  CAST(setting_id AS STRING) AS setting_id,
+  LOWER(LEFT(promocode,16)) as partner_promo --взять промокоды из файлика без f_program
+FROM `funnel-flowwow.Analyt_ChumichevN.partner_promocodes_gs_view`
+WHERE promocode IS NOT NULL AND REGEXP_CONTAINS(position,"f_program")=false
+  )
+, f_program AS (
+SELECT 
+  '' AS partner,
+  type,
+  CAST(setting_id AS STRING) AS setting_id,
+  LOWER(code) as partner_promo --промокоды программы лояльности c f_program
+FROM `funnel-flowwow.Analyt_ChumichevN.partner_promocodes_gs_view`
+RIGHT JOIN (SELECT code,type FROM `funnel-flowwow.MYSQL_EXPORT.f_program_loyalty_codes` UNION ALL
+SELECT code,type FROM `funnel-flowwow.MYSQL_EXPORT.f_program_loyalty_codes_log`) ON promocode=type
+WHERE promocode IS NOT NULL AND REGEXP_CONTAINS(position,"f_program")
+  )
+ , union_tables AS ( 
+SELECT DISTINCT -- объединить промокоды с данными по покупкам
+  DATE(purchase_timestamp) AS date,
+  CASE    
+    WHEN am.type = 'sberbank' OR STARTS_WITH(LOWER(promocode),'drug22') THEN 'Сбербанк Друг'
+    WHEN am.type = 'primezone' OR (STARTS_WITH(LOWER(promocode),'pz24') OR STARTS_WITH(LOWER(promocode),'pz25')) THEN 'Primezone'
+    WHEN am.type = 'union'  THEN 'Профсоюзы'
+    WHEN partner_name = 'TinkoffSuperApp' AND NOT STARTS_WITH(LOWER(promocode),'flowbestb12') THEN 'Тинькофф супер апп'
+    ELSE r.partner
+    END AS partner,
+    subcategory_name AS subcategory,
+    r.type,
+    am.type,
+    promocode,
+    purchase_id,
+    IF(product_category_id != 1,purchase_id, NULL) AS non_flower_purchases, 
+    IF(is_first_purchase = 1, purchase_id, NULL) AS first_purchases,
+    IF(is_first_purchase = 0, purchase_id, NULL) AS repeated_purchases,
+    product_price AS revenue,
+    promo_sum_rub,
+    bonus_company
+FROM `funnel-flowwow.BUSINESS_DM.cm_product_purchases_bonus_company`
+LEFT JOIN promo_contains r ON (STARTS_WITH(LOWER(promocode),LOWER(r.partner_promo)))
+LEFT JOIN f_program am ON LOWER(promocode) = LOWER(am.partner_promo)
+WHERE 1=1
+AND (r.partner_promo IS NOT NULL OR am.partner_promo IS NOT NULL OR partner_name="TinkoffSuperApp")
+AND DATE(purchase_timestamp) >= '2023-01-01'
+ORDER BY partner
+ )
+ , categories AS (
+SELECT -- разбивка по категориям
+  partner,
+  subcategory,
+  COUNT(DISTINCT non_flower_purchases) AS non_flower_purchases,
+  SUM(IF (non_flower_purchases IS NOT NULL, revenue, NULL)) AS non_flower_revenue
+FROM union_tables
+WHERE date BETWEEN '2024-03-01' AND CURRENT_DATE()-1
+GROUP BY 1,2
+ORDER BY non_flower_purchases DESC
+ )
+, without_categories AS ( 
+SELECT
+  partner,
+  COUNT(DISTINCT non_flower_purchases) AS non_flower_purchases,
+  SUM(IF (non_flower_purchases IS NOT NULL, revenue, NULL)) AS non_flower_revenue
+FROM union_tables
+WHERE date BETWEEN '2024-03-01' AND CURRENT_DATE()-1
+GROUP BY 1
+ORDER BY non_flower_purchases DESC
+)
+, b3 AS (
+SELECT
+  b.partner,
+  b.subcategory,
+  ROUND(b1.non_flower_purchases * SAFE_DIVIDE(b.non_flower_purchases , SUM(b.non_flower_purchases) OVER (PARTITION BY b.partner)),0) AS non_flower_purchases,
+  ROUND(b1.non_flower_revenue * SAFE_DIVIDE(b.non_flower_revenue , SUM(b.non_flower_revenue) OVER (PARTITION BY b.partner)),0) AS non_flower_revenue,
+FROM categories b LEFT JOIN without_categories b1 USING (partner)
+)
+SELECT
+  partner,
+  subcategory,
+  non_flower_purchases,
+  non_flower_revenue,
+  ROW_NUMBER() OVER (PARTITION BY partner ORDER BY non_flower_revenue DESC) AS row_num
+  FROM b3
+WHERE non_flower_revenue IS NOT NULL
+QUALIFY ROW_NUMBER() OVER (PARTITION BY partner ORDER BY non_flower_revenue DESC) <=5
+ORDER BY partner,non_flower_revenue DESC
